@@ -338,7 +338,7 @@ L4 仅剩 6 条走中性，**缺失类目进 5 星从 8 个降到 0 个**。
 
 ---
 
-## 五、跨市场验证类
+## 四、跨市场验证类
 
 ### 19. 同一套类目规则不能跨语言复用
 
@@ -411,9 +411,110 @@ L4 仅剩 6 条走中性，**缺失类目进 5 星从 8 个降到 0 个**。
 
 ---
 
-## 六、方法选择类（最重要的教训）
+### 23. 多义词必须配排除表（拉丁语系特有）
 
-### 23. 不要假设数据支持自定义权重
+**现象**（意大利站 5000 条）：
+用 `ricarica` 判定虚拟商品，误删 **139 条**，其中 134 条是这个词造成的：
+
+| 误判样例 | 实际是什么 |
+|---|---|
+| `Batterie AAA NiMH Performance ricarica` | 充电电池 |
+| `INIU Power Bank 20000mAh Ricarica Rapida` | 快充充电宝 |
+| `Cavo USB Ricarica Rapida` | 充电线 |
+| `Sapone Liquido Ricarica Universale` | 洗衣液补充装 |
+| `Ariasana Aero 360° Ricarica` | 芳香剂补充装 |
+
+**根因**：`ricarica` 在意大利语至少三义——充电（电池/线）、补充装（洗剂/芳香剂）、充值（电话卡）。
+单靠「包含该词」判定必然误伤。
+
+**正确做法**：双表机制
+
+```python
+VIRTUAL_KW = ["carta regalo", "gift card", "codice digitale",
+              "Robux", "V-Bucks", "abbonamento a", ...]
+VIRTUAL_EXCLUDE = ["ricarica", "ricaricabile", "batteria",
+                   "power bank", "cavo", "caricatore"]
+# 命中 KW 且未命中 EXCLUDE 才判定
+```
+
+**同时要**：优先用专有搭配而不是单词（`carta regalo` 而非 `regalo`）。
+
+**效果**：139 → 4 条，剩下全是真虚拟商品（PS Store / Xbox / Robux / eShop 卡）。
+
+**推广**：西语 `recarga`、法语 `recharge`、德语 `Aufladen` 都是同一个坑。
+
+---
+
+### 24. 营养成分名不能用来判定保健品
+
+**现象**（意大利站）：`vitamin` / `vitamina` 做保健品名称兜底，误判 **37 条化妆品**：
+
+| 误判样例 | 实际是什么 |
+|---|---|
+| `medicube Capsule Cream with Deep Vitamin C` | 面霜 |
+| `Garnier Siero Viso Vitamina C Anti-Macchie` | 精华液 |
+| `L'Oréal Paris Crema Viso Giorno Revitalift` | 日霜 |
+
+**根因**：营养成分名（vitamin / vitamina / collagen / 胶原蛋白）在
+**化妆品和保健品里都会出现**，不构成品类判据。
+
+**正确做法**：名称兜底只用「品类专有词」
+
+```python
+# ❌ 错：营养成分名
+SUPP_NAME_KW = ["vitamin", "vitamina", "collagen"]
+
+# ✅ 对：品类专有词
+SUPP_NAME_KW = ["integratore", "integratore alimentare",
+                "supplemento", "proteine in polvere", "omega 3"]
+```
+
+**主判据仍应是类目**（`Vitamine, minerali e integratori`），名称只是兜底。
+
+**同理**：日语 `ビタミン`、西语 `vitamina`、法语 `vitamine` 都适用。
+
+---
+
+### 25. 「大类组」不能整组判定，必须按叶子分流
+
+**现象**（意大利站）：
+`Salute e cura della persona > Pulizia e cura della casa` 整组划为化工，
+但该组同时含纸品，**50+ 条卫生纸被误判为化工**：
+
+| 实际内容 | 应归类 |
+|---|---|
+| `Carta igienica`（卫生纸）、`Rotoli`（卷纸） | 日化 |
+| `Tovaglioli e fazzoletti`（餐巾纸巾） | 日化 |
+| `Detersivo`（洗衣液）、`Candeggina`（漂白剂） | 化工 |
+
+**根因**：亚马逊的类目组常把「清洁用品」作为一个大类，
+但里面既有化学品（液体）也有纸品（固体耗材）。整组判定必然误伤一半。
+
+**正确做法**：建「组内例外表」，优先判定
+
+```python
+# 先判例外
+CHEM_TO_DAILY = {"Carta igienica", "Rotoli di carta igienica",
+                 "Prodotti di carta", "Tovaglioli e fazzoletti",
+                 "Panni e spugne", "Salviette umidificate"}
+
+if leaf in CHEM_TO_DAILY:
+    → 日化
+elif leaf in CHEM_LEAVES:
+    → 化工
+```
+
+**判据**：**看叶子（leaf）不看组（sub）**。
+只要一个 sub 下混着两种品类，就必须按 leaf 分流。
+
+**自查方法**：跑完分类后统计每个删除类别的三级叶子分布，
+若某类别下出现明显不该有的叶子 → 说明整组判定误伤。
+
+---
+
+## 五、方法选择类（最重要的教训）
+
+### 26. 不要假设数据支持自定义权重
 
 **现象**：连续 6 个版本都在试图"算出"权重
 （熵权、CRITIC、PCA、组合赋权、先验融合、限幅调整），
@@ -432,7 +533,7 @@ L4 仅剩 6 条走中性，**缺失类目进 5 星从 8 个降到 0 个**。
 
 ---
 
-### 24. 每个"改进"都要被检验否决一次
+### 27. 每个"改进"都要被检验否决一次
 
 **做法**：每次改模型，先问"这个改动应该让哪个指标变好"，
 然后用数据验证。如果没变好，改回去。
@@ -444,9 +545,11 @@ L4 仅剩 6 条走中性，**缺失类目进 5 星从 8 个降到 0 个**。
 
 ---
 
-### 25. 保留失败记录
+### 28. 保留失败记录
 
 **为什么**：知道"什么方法不 work"和知道"什么 work"同样重要。
 下次遇到类似数据，直接跳过已知失败路径。
 
 本文件就是失败记录的产物。
+
+
