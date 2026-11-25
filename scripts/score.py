@@ -17,6 +17,7 @@ import bisect
 import json
 import math
 import os
+import re
 import sys
 from collections import Counter, defaultdict
 
@@ -95,33 +96,92 @@ class Scorer:
             return -math.log10(v) if v > 0 else None
         return -v
 
-    # ── 类目归属
+    # ── 类目归属（三级兜底）
     def _assign(self):
+        """按三级兜底建立类目键。
+
+        L1 类目路径正常 → 二级类目（不足阈值退一级）
+        L2 类目路径缺失 → 用「大类名称」列兜底
+        L3 大类也缺失 → 用「小类名称」列剥排名前缀后兜底
+        L4 全部缺失   → 标记 cat_missing，不参与类目级计算
+
+        为什么需要兜底：类目路径为 '--' 的记录若全部归入同一个 "(无)" 组，
+        该组会横跨完全不同的品类（游戏/母婴/日用品），组内互相比较无意义；
+        且若该组体量大，整体会被推高类目分，污染评分。
+        """
         col = self.mp["类目路径"]
+        alt1 = self.mp.get("大类")
+        alt2 = self.mp.get("小类")
+
         c2, c1 = defaultdict(list), defaultdict(list)
         p2, p1 = {}, {}
+        self.cat_missing = {}
+        self.cat_source = {}
+
         for r in self.rows:
             segs = zh_segs(r["txt"].get(col))
-            k2 = "/".join(segs[:2]) if len(segs) >= 2 else (segs[0] if segs else "(无)")
-            k1 = segs[0] if segs else "(无)"
+
+            if segs:
+                k2 = "/".join(segs[:2]) if len(segs) >= 2 else segs[0]
+                k1 = segs[0]
+                src = "L1_路径"
+                missing = False
+            else:
+                # L2 大类名称
+                a1 = (r["txt"].get(alt1, "") or "").strip() if alt1 else ""
+                if a1 and a1 not in ("--", "-", ""):
+                    k2 = k1 = a1
+                    src = "L2_大类"
+                    missing = False
+                else:
+                    # L3 小类名称（剥离 "#1," 之类排名前缀）
+                    a2 = (r["txt"].get(alt2, "") or "").strip() if alt2 else ""
+                    a2 = re.sub(r"^#\d+[,，.:：]?\s*", "", a2).strip()
+                    if a2 and a2 not in ("--", "-", ""):
+                        k2 = k1 = a2
+                        src = "L3_小类"
+                        missing = False
+                    else:
+                        # L4 完全缺失
+                        k2 = k1 = "(无类目)"
+                        src = "L4_缺失"
+                        missing = True
+
             c2[k2].append(r)
             c1[k1].append(r)
             p2[r["row"]], p1[r["row"]] = k2, k1
+            self.cat_missing[r["row"]] = missing
+            self.cat_source[r["row"]] = src
 
         thr = self.cfg["min_cat_size"]
-        self.lvl = {r["row"]: (("2", p2[r["row"]]) if len(c2[p2[r["row"]]]) >= thr
+        self.lvl = {r["row"]: (("2", p2[r["row"]])
+                               if len(c2[p2[r["row"]]]) >= thr
                                else ("1", p1[r["row"]]))
                     for r in self.rows}
         self.groups = defaultdict(list)
         for r in self.rows:
             self.groups[self.lvl[r["row"]]].append(r)
 
+        # 统计兜底情况
+        from collections import Counter
+        self.assign_stats = Counter(self.cat_source.values())
+
     # ── L1 类目内标准化
     def _normalize(self):
+        """类目内标准化；类目缺失的产品改用全局标准化。
+
+        缺失类目的产品没有可信的同类参照组，若强行塞进 "(无类目)" 组，
+        等于拿它和随机其他品类比。全局标准化至少保证它和整个池子比，
+        虽不如类目内精准，但不会被错误分组放大。
+        """
         self.X = {}
         for sem, direction in SIGNALS:
             col = [0.5] * self.N
+
+            # ① 有类目的产品：类目内标准化
             for gk, ps in self.groups.items():
+                if gk[1] == "(无类目)":
+                    continue
                 idxs = [i for i, r in enumerate(self.rows)
                         if self.lvl[r["row"]] == gk]
                 if len(idxs) < 3:
@@ -138,6 +198,25 @@ class Scorer:
                       else [0.5] * len(xs))
                 for j, (pos, _) in enumerate(pres):
                     col[idxs[pos]] = nx[j]
+
+            # ② 类目缺失的产品：全局标准化
+            miss_idx = [i for i, r in enumerate(self.rows)
+                        if self.cat_missing.get(r["row"])]
+            if miss_idx:
+                vals = [self.sig_value(self.rows[i], sem, direction)
+                        for i in miss_idx]
+                pres = [(j, v) for j, v in enumerate(vals) if v is not None]
+                if len(pres) >= 3:
+                    xs = winsorize([v for _, v in pres],
+                                   self.cfg["winsor_lo"], self.cfg["winsor_hi"])
+                    lo, hi = min(xs), max(xs)
+                    nx = ([(x - lo) / (hi - lo) for x in xs] if hi > lo
+                          else [0.5] * len(xs))
+                    for j, (pos, _) in enumerate(pres):
+                        col[miss_idx[pos]] = nx[j]
+                elif pres:
+                    col[miss_idx[0]] = 0.5
+
             self.X[sem] = col
 
     # ── L2 产品分
@@ -156,6 +235,10 @@ class Scorer:
         cfg = self.cfg
         cf = {}
         for gk, ps in self.groups.items():
+            # 跳过无类目组：该组横跨不同品类，CR/新品/容量都无业务含义
+            if gk[1] == "(无类目)":
+                continue
+
             n = len(ps)
             amt = sum((p["nums"].get(self.mp["月销额"]) or 0) for p in ps)
             qtys = sorted((p["nums"].get(self.mp["月销量"]) or 0 for p in ps),
@@ -234,13 +317,18 @@ class Scorer:
             }
         self.CAT = {k: v["cat"] for k, v in self.cat_detail.items()}
 
+        # 无类目产品的替代类目分：取全体类目分中位（中性值）
+        vals = sorted(self.CAT.values())
+        self.CAT_FALLBACK = vals[len(vals) // 2] if vals else 50.0
+
     # ── L4 合成
     def _combine(self):
         cfg = self.cfg
         w = cfg["cat_weight"]
         self.FINAL, self.penalty, self.gates = [], [], []
         for i, r in enumerate(self.rows):
-            cat = self.CAT[self.lvl[r["row"]]]
+            gk = self.lvl[r["row"]]
+            cat = self.CAT.get(gk, self.CAT_FALLBACK)
             s = self.PROD[i] * ((1 - w) + w * cat / 100)
 
             p, why = 0.0, []
@@ -277,12 +365,20 @@ class Scorer:
         recs = []
         for i, r in enumerate(self.rows):
             gk = self.lvl[r["row"]]
-            cd = self.cat_detail[gk]
+            missing = self.cat_missing.get(r["row"], False)
+            cd = self.cat_detail.get(gk)
+            if cd is None:
+                # 类目缺失：类目级指标用中性占位
+                cd = {"cap": 50.0, "trd": 50.0, "cmp": 50.0, "new": 50.0,
+                      "cat": round(self.CAT_FALLBACK, 2), "amt": 0,
+                      "trend": 0.0, "cr3": 0.0, "cr10": 0.0, "new_qty_r": 0.0}
             recs.append({
                 "row": r["row"],
                 "asin": r["txt"].get(self.mp["ASIN"], ""),
                 "name": r["txt"].get(self.mp["产品名称"], ""),
                 "cat": gk[1], "cat_level": gk[0],
+                "cat_missing": missing,
+                "cat_source": self.cat_source.get(r["row"], ""),
                 "g": r["nums"].get(self.mp["月销量"]),
                 "v": r["nums"].get(self.mp["评价数"]),
                 "w": r["nums"].get(self.mp["评分"]),
@@ -304,6 +400,8 @@ class Scorer:
             })
         return {"model": "four-layer opportunity scoring",
                 "config": self.cfg, "col_mapping": self.mp,
+                "cat_assign_stats": dict(self.assign_stats),
+                "cat_fallback": round(self.CAT_FALLBACK, 2),
                 "records": recs,
                 "cat_detail": {f"{k[0]}|{k[1]}": v
                                for k, v in self.cat_detail.items()}}
@@ -352,6 +450,17 @@ def main():
     for k in (5, 4, 3, 2, 1):
         print(f"  {k}星 {dist[k]:5d} ({dist[k]/N*100:5.1f}%)")
     print(f"硬约束命中: {sum(1 for r in recs if r['penalty'] > 0)}")
+
+    stats = out.get("cat_assign_stats", {})
+    if stats:
+        print("\n类目归属兜底:")
+        for k in ("L1_路径", "L2_大类", "L3_小类", "L4_缺失"):
+            if k in stats:
+                n = stats[k]
+                print(f"  {k:<10} {n:>5} ({n/N*100:5.1f}%)")
+        nmiss = stats.get("L4_缺失", 0)
+        if nmiss:
+            print(f"  无类目产品取替代类目分 {out.get('cat_fallback', 0):.1f}")
 
     print("\n类目分 Top 8:")
     for k, v in sorted(out["cat_detail"].items(),
